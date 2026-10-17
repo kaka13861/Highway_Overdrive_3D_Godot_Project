@@ -251,6 +251,31 @@ jobs:
           echo "Export preset:"
           cat "$PROJECT_DIR/export_presets.cfg"
 
+      - name: Enable ETC2/ASTC texture import (required for Android export)
+        shell: bash
+        run: |
+          set -eux
+
+          PG="$PROJECT_DIR/project.godot"
+          KEY="textures/vram_compression/import_etc2_astc"
+
+          echo "--- project.godot before ---"
+          cat "$PG"
+
+          if grep -q "^$KEY=" "$PG"; then
+            sed -i "s|^$KEY=.*|$KEY=true|" "$PG"
+          elif grep -q '^\[rendering\]' "$PG"; then
+            sed -i "/^\[rendering\]/a $KEY=true" "$PG"
+          else
+            printf '\n[rendering]\n\n%s=true\n' "$KEY" >> "$PG"
+          fi
+
+          echo "--- rendering section after ---"
+          grep -n -A5 '^\[rendering\]' "$PG"
+
+          # Drop any stale import cache so textures are re-imported with ETC2/ASTC.
+          rm -rf "$PROJECT_DIR/.godot"
+
       - name: Import Godot project resources
         shell: bash
         run: |
