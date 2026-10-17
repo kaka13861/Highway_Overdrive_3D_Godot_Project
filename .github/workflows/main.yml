@@ -1,0 +1,277 @@
+name: Build Highway Overdrive APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - '**'
+      - '.github/workflows/main.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Android APK
+    runs-on: ubuntu-22.04
+
+    container:
+      image: barichello/godot-ci:4.2.2
+
+    env:
+      ANDROID_HOME: /opt/android-sdk
+      ANDROID_SDK_ROOT: /opt/android-sdk
+      JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+
+    steps:
+      - name: Download repository
+        uses: actions/checkout@v4
+
+      - name: Install Java and Android SDK tools
+        shell: bash
+        run: |
+          set -eux
+
+          apt-get update
+          apt-get install -y \
+            openjdk-17-jdk \
+            wget \
+            unzip \
+            ca-certificates
+
+          mkdir -p "$ANDROID_HOME/cmdline-tools"
+
+          wget -q \
+            https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip \
+            -O /tmp/android-tools.zip
+
+          mkdir -p /tmp/android-tools
+          unzip -q /tmp/android-tools.zip -d /tmp/android-tools
+
+          rm -rf "$ANDROID_HOME/cmdline-tools/latest"
+          mkdir -p "$ANDROID_HOME/cmdline-tools/latest"
+
+          cp -r /tmp/android-tools/cmdline-tools/. \
+            "$ANDROID_HOME/cmdline-tools/latest/"
+
+          echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
+          echo "$JAVA_HOME/bin" >> "$GITHUB_PATH"
+
+          chmod +x "$ANDROID_HOME/cmdline-tools/latest/bin/"*
+
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          set -eux
+
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$JAVA_HOME/bin:$PATH"
+
+          yes | sdkmanager --sdk_root="$ANDROID_HOME" --licenses || true
+
+          sdkmanager --sdk_root="$ANDROID_HOME" \
+            "platform-tools" \
+            "platforms;android-33" \
+            "build-tools;33.0.2" \
+            "cmdline-tools;latest" \
+            "cmake;3.10.2.4988404" \
+            "ndk;23.2.8568313"
+
+          echo "Installed Android build tools:"
+          ls -la "$ANDROID_HOME/build-tools"
+
+          echo "Installed Android platforms:"
+          ls -la "$ANDROID_HOME/platforms"
+
+      - name: Install Godot Android export templates
+        shell: bash
+        run: |
+          set -eux
+
+          mkdir -p "$HOME/.local/share/godot/export_templates"
+
+          wget -q \
+            https://github.com/godotengine/godot/releases/download/4.2.2-stable/Godot_v4.2.2-stable_export_templates.tpz \
+            -O /tmp/godot-templates.tpz
+
+          mkdir -p /tmp/godot-templates
+          unzip -q /tmp/godot-templates.tpz -d /tmp/godot-templates
+
+          mkdir -p "$HOME/.local/share/godot/export_templates/4.2.2.stable"
+
+          cp -r /tmp/godot-templates/templates/. \
+            "$HOME/.local/share/godot/export_templates/4.2.2.stable/"
+
+          ls -la "$HOME/.local/share/godot/export_templates/4.2.2.stable"
+
+      - name: Find and extract Godot project
+        shell: bash
+        run: |
+          set -eux
+
+          PROJECT_DIR=""
+
+          # First, check whether project.godot is already in the repository.
+          if find . -name project.godot -type f -print -quit | grep -q .; then
+            PROJECT_FILE="$(find . -name project.godot -type f -print -quit)"
+            PROJECT_DIR="$(dirname "$PROJECT_FILE")"
+          else
+            # Otherwise, extract the uploaded project ZIP.
+            ZIP_FILE="$(find . -maxdepth 1 -type f -iname '*.zip' -print -quit)"
+
+            if [ -z "$ZIP_FILE" ]; then
+              echo "ERROR: No project.godot file or ZIP file was found."
+              echo "Upload your Highway Overdrive project ZIP to the repository root."
+              exit 1
+            fi
+
+            mkdir -p /tmp/highway-project
+            unzip -oq "$ZIP_FILE" -d /tmp/highway-project
+
+            PROJECT_FILE="$(find /tmp/highway-project -name project.godot -type f -print -quit)"
+
+            if [ -z "$PROJECT_FILE" ]; then
+              echo "ERROR: The ZIP does not contain a project.godot file."
+              exit 1
+            fi
+
+            PROJECT_DIR="$(dirname "$PROJECT_FILE")"
+          fi
+
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Godot project found at: $PROJECT_DIR"
+
+          ls -la "$PROJECT_DIR"
+          test -f "$PROJECT_DIR/project.godot"
+
+      - name: Configure Java, Android SDK, and APK export
+        shell: bash
+        run: |
+          set -eux
+
+          mkdir -p "$HOME/.config/godot"
+          mkdir -p "$HOME/.android"
+          mkdir -p "$PROJECT_DIR/build"
+
+          # Confirm Java is available at the configured location.
+          test -x "$JAVA_HOME/bin/java"
+          java -version
+
+          # Create a debug keystore if one does not already exist.
+          if [ ! -f "$HOME/.android/debug.keystore" ]; then
+            keytool -genkeypair \
+              -keystore "$HOME/.android/debug.keystore" \
+              -storepass android \
+              -alias androiddebugkey \
+              -keypass android \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
+          # Tell Godot where Java and the Android SDK are installed.
+          cat > "$HOME/.config/godot/editor_settings-4.tres" <<EOF
+          [gd_resource type="EditorSettings" format=3]
+
+          [resource]
+          export/android/java_sdk_path = "$JAVA_HOME"
+          export/android/android_sdk_path = "$ANDROID_HOME"
+          EOF
+
+          # Create an Android export preset for this project.
+          cat > "$PROJECT_DIR/export_presets.cfg" <<'EOF'
+          [preset.0]
+
+          name="Android"
+          platform="Android"
+          runnable=true
+          dedicated_server=false
+          custom_features=""
+          export_filter="all_resources"
+          include_filter=""
+          exclude_filter=""
+          export_path="build/HighwayOverdrive.apk"
+          encryption_include_filters=""
+          encryption_exclude_filters=""
+          encrypt_pck=false
+          encrypt_directory=false
+
+          [preset.0.options]
+
+          custom_template/debug=""
+          custom_template/release=""
+          gradle_build/use_gradle_build=false
+          gradle_build/gradle_build_directory=""
+          gradle_build/android_source_template=""
+          gradle_build/compress_native_libraries=false
+          gradle_build/export_format=0
+          architectures/armeabi-v7a=false
+          architectures/arm64-v8a=true
+          architectures/x86=false
+          architectures/x86_64=false
+          version/code=1
+          version/name="1.0"
+          package/unique_name="com.highwayoverdrive.game"
+          package/name="Highway Overdrive"
+          package/signed=true
+          screen/immersive_mode=true
+          EOF
+
+          echo "Java path:"
+          ls -l "$JAVA_HOME/bin/java"
+
+          echo "Android SDK paths:"
+          ls -ld "$ANDROID_HOME"
+          ls -ld "$ANDROID_HOME/platforms/android-33"
+          ls -ld "$ANDROID_HOME/build-tools/33.0.2"
+
+          echo "Export preset:"
+          cat "$PROJECT_DIR/export_presets.cfg"
+
+      - name: Import Godot project resources
+        shell: bash
+        run: |
+          set -eux
+
+          export PATH="$JAVA_HOME/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/cmdline-tools/latest/bin:$PATH"
+
+          godot --version
+
+          godot --headless \
+            --editor \
+            --path "$PROJECT_DIR" \
+            --quit
+
+      - name: Build Android APK
+        shell: bash
+        run: |
+          set -eux
+
+          export PATH="$JAVA_HOME/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/cmdline-tools/latest/bin:$PATH"
+
+          mkdir -p "$PROJECT_DIR/build"
+
+          godot --headless \
+            --path "$PROJECT_DIR" \
+            --export-debug "Android" \
+            "$PROJECT_DIR/build/HighwayOverdrive.apk"
+
+          if [ ! -s "$PROJECT_DIR/build/HighwayOverdrive.apk" ]; then
+            echo "ERROR: APK was not created."
+            exit 1
+          fi
+
+          echo "APK successfully created:"
+          ls -lh "$PROJECT_DIR/build/HighwayOverdrive.apk"
+
+      - name: Upload APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Highway-Overdrive-Android-APK
+          path: ${{ env.PROJECT_DIR }}/build/HighwayOverdrive.apk
+          if-no-files-found: error
+          retention-days: 14
