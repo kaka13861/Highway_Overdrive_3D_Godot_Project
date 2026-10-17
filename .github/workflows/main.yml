@@ -5,9 +5,9 @@ on:
   push:
     branches:
       - main
-    paths:
-      - '**'
-      - '.github/workflows/main.yml'
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
 
 permissions:
   contents: read
@@ -71,13 +71,12 @@ jobs:
 
           yes | sdkmanager --sdk_root="$ANDROID_HOME" --licenses || true
 
+          # NDK and CMake are not needed because gradle_build/use_gradle_build=false
           sdkmanager --sdk_root="$ANDROID_HOME" \
             "platform-tools" \
             "platforms;android-33" \
             "build-tools;33.0.2" \
-            "cmdline-tools;latest" \
-            "cmake;3.10.2.4988404" \
-            "ndk;23.2.8568313"
+            "cmdline-tools;latest"
 
           echo "Installed Android build tools:"
           ls -la "$ANDROID_HOME/build-tools"
@@ -85,26 +84,30 @@ jobs:
           echo "Installed Android platforms:"
           ls -la "$ANDROID_HOME/platforms"
 
-      - name: Install Godot Android export templates
+      - name: Install Godot export templates
         shell: bash
         run: |
           set -eux
 
-          mkdir -p "$HOME/.local/share/godot/export_templates"
+          TEMPLATE_DIR="$HOME/.local/share/godot/export_templates/4.2.2.stable"
 
-          wget -q \
-            https://github.com/godotengine/godot/releases/download/4.2.2-stable/Godot_v4.2.2-stable_export_templates.tpz \
-            -O /tmp/godot-templates.tpz
+          # The godot-ci image usually ships the templates already; skip the download if so.
+          if [ -f "$TEMPLATE_DIR/android_debug.apk" ]; then
+            echo "Export templates already present."
+          else
+            mkdir -p "$TEMPLATE_DIR"
 
-          mkdir -p /tmp/godot-templates
-          unzip -q /tmp/godot-templates.tpz -d /tmp/godot-templates
+            wget -q \
+              https://github.com/godotengine/godot/releases/download/4.2.2-stable/Godot_v4.2.2-stable_export_templates.tpz \
+              -O /tmp/godot-templates.tpz
 
-          mkdir -p "$HOME/.local/share/godot/export_templates/4.2.2.stable"
+            mkdir -p /tmp/godot-templates
+            unzip -q /tmp/godot-templates.tpz -d /tmp/godot-templates
 
-          cp -r /tmp/godot-templates/templates/. \
-            "$HOME/.local/share/godot/export_templates/4.2.2.stable/"
+            cp -r /tmp/godot-templates/templates/. "$TEMPLATE_DIR/"
+          fi
 
-          ls -la "$HOME/.local/share/godot/export_templates/4.2.2.stable"
+          ls -la "$TEMPLATE_DIR"
 
       - name: Find and extract Godot project
         shell: bash
@@ -116,7 +119,7 @@ jobs:
           # First, check whether project.godot is already in the repository.
           if find . -name project.godot -type f -print -quit | grep -q .; then
             PROJECT_FILE="$(find . -name project.godot -type f -print -quit)"
-            PROJECT_DIR="$(dirname "$PROJECT_FILE")"
+            PROJECT_DIR="$(cd "$(dirname "$PROJECT_FILE")" && pwd)"
           else
             # Otherwise, extract the uploaded project ZIP.
             ZIP_FILE="$(find . -maxdepth 1 -type f -iname '*.zip' -print -quit)"
@@ -161,7 +164,7 @@ jobs:
 
           # Create a debug keystore if one does not already exist.
           if [ ! -f "$HOME/.android/debug.keystore" ]; then
-            keytool -genkeypair \
+            "$JAVA_HOME/bin/keytool" -genkeypair \
               -keystore "$HOME/.android/debug.keystore" \
               -storepass android \
               -alias androiddebugkey \
@@ -172,17 +175,23 @@ jobs:
               -dname "CN=Android Debug,O=Android,C=US"
           fi
 
-          # Tell Godot where Java and the Android SDK are installed.
+          # Tell Godot where Java, the Android SDK and the debug keystore are.
+          # (Unquoted EOF so the shell expands $JAVA_HOME, $ANDROID_HOME and $HOME.)
           cat > "$HOME/.config/godot/editor_settings-4.tres" <<EOF
           [gd_resource type="EditorSettings" format=3]
 
           [resource]
           export/android/java_sdk_path = "$JAVA_HOME"
           export/android/android_sdk_path = "$ANDROID_HOME"
+          export/android/debug_keystore = "$HOME/.android/debug.keystore"
+          export/android/debug_keystore_user = "androiddebugkey"
+          export/android/debug_keystore_pass = "android"
           EOF
 
-          # Create an Android export preset for this project.
-          cat > "$PROJECT_DIR/export_presets.cfg" <<'EOF'
+          # Create an Android export preset only if the project doesn't already have one.
+          # (Unquoted EOF so $HOME expands to the real keystore path.)
+          if [ ! -f "$PROJECT_DIR/export_presets.cfg" ]; then
+          cat > "$PROJECT_DIR/export_presets.cfg" <<EOF
           [preset.0]
 
           name="Android"
@@ -204,10 +213,6 @@ jobs:
           custom_template/debug=""
           custom_template/release=""
           gradle_build/use_gradle_build=false
-          gradle_build/gradle_build_directory=""
-          gradle_build/android_source_template=""
-          gradle_build/compress_native_libraries=false
-          gradle_build/export_format=0
           architectures/armeabi-v7a=false
           architectures/arm64-v8a=true
           architectures/x86=false
@@ -217,8 +222,14 @@ jobs:
           package/unique_name="com.highwayoverdrive.game"
           package/name="Highway Overdrive"
           package/signed=true
+          keystore/debug="$HOME/.android/debug.keystore"
+          keystore/debug_user="androiddebugkey"
+          keystore/debug_password="android"
           screen/immersive_mode=true
           EOF
+          else
+            echo "Using the project's existing export_presets.cfg"
+          fi
 
           echo "Java path:"
           ls -l "$JAVA_HOME/bin/java"
@@ -240,10 +251,11 @@ jobs:
 
           godot --version
 
+          # The editor can exit non-zero after a successful import; the export step catches real failures.
           godot --headless \
             --editor \
             --path "$PROJECT_DIR" \
-            --quit
+            --quit || true
 
       - name: Build Android APK
         shell: bash
@@ -253,6 +265,16 @@ jobs:
           export PATH="$JAVA_HOME/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/cmdline-tools/latest/bin:$PATH"
 
           mkdir -p "$PROJECT_DIR/build"
+
+          echo "Checking Android SDK..."
+          ls -la "$ANDROID_HOME/build-tools/33.0.2"
+          ls -la "$ANDROID_HOME/platforms/android-33"
+
+          echo "Checking debug keystore..."
+          ls -l "$HOME/.android/debug.keystore"
+
+          echo "Checking Java..."
+          java -version
 
           godot --headless \
             --path "$PROJECT_DIR" \
@@ -264,14 +286,18 @@ jobs:
             exit 1
           fi
 
+          # Copy into the workspace so the upload step always finds it.
+          mkdir -p "$GITHUB_WORKSPACE/output"
+          cp "$PROJECT_DIR/build/HighwayOverdrive.apk" "$GITHUB_WORKSPACE/output/HighwayOverdrive.apk"
+
           echo "APK successfully created:"
-          ls -lh "$PROJECT_DIR/build/HighwayOverdrive.apk"
+          ls -lh "$GITHUB_WORKSPACE/output/HighwayOverdrive.apk"
 
       - name: Upload APK
         if: success()
         uses: actions/upload-artifact@v4
         with:
           name: Highway-Overdrive-Android-APK
-          path: ${{ env.PROJECT_DIR }}/build/HighwayOverdrive.apk
+          path: output/HighwayOverdrive.apk
           if-no-files-found: error
           retention-days: 14
